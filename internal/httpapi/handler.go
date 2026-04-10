@@ -24,11 +24,17 @@ func New(svc *service.Service) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(api.RoutePutObject, h.handlePutObject)
+	mux.HandleFunc("PUT /svc/s3/v1/scopes/{scope}/objects/{key...}", h.handlePutObject)
 	mux.HandleFunc(api.RouteDeleteObject, h.handleDeleteObject)
+	mux.HandleFunc("DELETE /svc/s3/v1/objects/{storage_key...}", h.handleDeleteObject)
 	mux.HandleFunc(api.RouteMintUploadIntent, h.handleMintUploadIntent)
+	mux.HandleFunc("POST /svc/s3/v1/upload-intents", h.handleMintUploadIntent)
 	mux.HandleFunc(api.RouteInspectUploadIntent, h.handleInspectUploadIntent)
+	mux.HandleFunc("GET /svc/s3/v1/upload-intents/{intent_id}", h.handleInspectUploadIntent)
 	mux.HandleFunc(api.RouteFinalizeUploadIntent, h.handleFinalizeUploadIntent)
+	mux.HandleFunc("POST /svc/s3/v1/upload-intents/{intent_id}/finalize", h.handleFinalizeUploadIntent)
 	mux.HandleFunc(api.RouteIssueReadLink, h.handleIssueReadLink)
+	mux.HandleFunc("POST /svc/s3/v1/read-links", h.handleIssueReadLink)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
