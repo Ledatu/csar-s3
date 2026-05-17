@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.4
 	github.com/aws/smithy-go v1.24.2
 	github.com/google/uuid v1.6.0
-	github.com/ledatu/csar-core v0.1.26
+	github.com/ledatu/csar-core v0.1.27
 	gopkg.in/yaml.v3 v3.0.1
 )
 

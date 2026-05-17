@@ -23,6 +23,8 @@ const (
 type MintUploadIntentRequest struct {
 	Scope         string            `json:"scope"`
 	Filename      string            `json:"filename,omitempty"`
+	ObjectKey     string            `json:"object_key,omitempty"`
+	KeyPrefix     string            `json:"key_prefix,omitempty"`
 	ContentType   string            `json:"content_type"`
 	ContentLength int64             `json:"content_length"`
 	Metadata      map[string]string `json:"metadata,omitempty"`

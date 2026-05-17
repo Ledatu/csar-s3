@@ -101,6 +101,12 @@ func TestMintAndFinalizeUploadIntent(t *testing.T) {
 	if intent.Object.Key == "" || intent.Object.Bucket != "avatar-bucket" {
 		t.Fatalf("unexpected intent object: %#v", intent.Object)
 	}
+	if !strings.HasPrefix(intent.Object.Key, "profiles/avatars/user-1/") {
+		t.Fatalf("expected owner-prefixed key, got %q", intent.Object.Key)
+	}
+	if !strings.HasSuffix(intent.Object.Key, ".png") {
+		t.Fatalf("expected .png key, got %q", intent.Object.Key)
+	}
 	if !strings.HasPrefix(storageKey, "authn-avatars:") {
 		t.Fatalf("unexpected storage key %q", storageKey)
 	}
@@ -125,6 +131,113 @@ func TestMintAndFinalizeUploadIntent(t *testing.T) {
 	}
 	if finalizedStorageKey == "" {
 		t.Fatalf("expected finalized storage key")
+	}
+}
+
+func TestMintUploadIntentUsesExactObjectKey(t *testing.T) {
+	t.Parallel()
+
+	svc, _ := newTestService(t)
+
+	intent, storageKey, err := svc.MintUploadIntent(context.Background(), MintUploadIntentRequest{
+		Scope:         "authn-avatars",
+		ObjectKey:     "users/user-1/photos/photo.png",
+		ContentType:   "image/png",
+		ContentLength: 5,
+	})
+	if err != nil {
+		t.Fatalf("MintUploadIntent returned error: %v", err)
+	}
+
+	wantKey := "profiles/avatars/users/user-1/photos/photo.png"
+	if intent.Object.Key != wantKey {
+		t.Fatalf("expected object key %q, got %q", wantKey, intent.Object.Key)
+	}
+	if storageKey != "authn-avatars:"+wantKey {
+		t.Fatalf("unexpected storage key %q", storageKey)
+	}
+}
+
+func TestMintUploadIntentUsesKeyPrefix(t *testing.T) {
+	t.Parallel()
+
+	svc, _ := newTestService(t)
+
+	intent, storageKey, err := svc.MintUploadIntent(context.Background(), MintUploadIntentRequest{
+		Scope:         "authn-avatars",
+		Filename:      "photo.png",
+		KeyPrefix:     "users/user-1/photos",
+		ContentType:   "image/png",
+		ContentLength: 5,
+	})
+	if err != nil {
+		t.Fatalf("MintUploadIntent returned error: %v", err)
+	}
+
+	wantPrefix := "profiles/avatars/users/user-1/photos/"
+	if !strings.HasPrefix(intent.Object.Key, wantPrefix) {
+		t.Fatalf("expected key prefix %q, got %q", wantPrefix, intent.Object.Key)
+	}
+	if !strings.HasSuffix(intent.Object.Key, ".png") {
+		t.Fatalf("expected .png key, got %q", intent.Object.Key)
+	}
+	if storageKey != "authn-avatars:"+intent.Object.Key {
+		t.Fatalf("unexpected storage key %q", storageKey)
+	}
+}
+
+func TestMintUploadIntentRejectsConflictingKeyFields(t *testing.T) {
+	t.Parallel()
+
+	svc, _ := newTestService(t)
+
+	_, _, err := svc.MintUploadIntent(context.Background(), MintUploadIntentRequest{
+		Scope:         "authn-avatars",
+		ObjectKey:     "users/user-1/photo.png",
+		KeyPrefix:     "users/user-1/photos",
+		ContentType:   "image/png",
+		ContentLength: 5,
+	})
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+}
+
+func TestMintUploadIntentRejectsInvalidKeys(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		objectKey string
+		keyPrefix string
+	}{
+		{name: "object leading slash", objectKey: "/users/user-1/photo.png"},
+		{name: "object trailing slash", objectKey: "users/user-1/"},
+		{name: "object dotdot", objectKey: "users/../photo.png"},
+		{name: "object empty segment", objectKey: "users//photo.png"},
+		{name: "prefix leading slash", keyPrefix: "/users/user-1/photos"},
+		{name: "prefix trailing slash", keyPrefix: "users/user-1/photos/"},
+		{name: "prefix dotdot", keyPrefix: "users/../photos"},
+		{name: "prefix empty segment", keyPrefix: "users//photos"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			svc, _ := newTestService(t)
+			_, _, err := svc.MintUploadIntent(context.Background(), MintUploadIntentRequest{
+				Scope:         "authn-avatars",
+				ObjectKey:     tt.objectKey,
+				KeyPrefix:     tt.keyPrefix,
+				ContentType:   "image/png",
+				ContentLength: 5,
+			})
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+		})
 	}
 }
 

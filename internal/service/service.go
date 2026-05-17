@@ -63,6 +63,8 @@ type ScopeRuntime struct {
 type MintUploadIntentRequest struct {
 	Scope         string
 	Filename      string
+	ObjectKey     string
+	KeyPrefix     string
 	ContentType   string
 	ContentLength int64
 	Metadata      map[string]string
@@ -201,7 +203,7 @@ func (s *Service) MintUploadIntent(ctx context.Context, in MintUploadIntentReque
 		return corestorage.UploadIntent{}, "", csarerrors.Validation("ttl exceeds configured max_intent_ttl")
 	}
 
-	relativeKey, err := generatedRelativeKey(in.Filename, contentType, in.Metadata)
+	relativeKey, err := resolveUploadIntentRelativeKey(in.Filename, contentType, in.Metadata, in.ObjectKey, in.KeyPrefix)
 	if err != nil {
 		return corestorage.UploadIntent{}, "", csarerrors.Validation("%v", err)
 	}
@@ -414,18 +416,27 @@ func keyMatchesPrefix(key, prefix string) bool {
 	return key == prefix || strings.HasPrefix(key, prefix+"/")
 }
 
-func generatedRelativeKey(filename, contentType string, metadata map[string]string) (string, error) {
-	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(filename)))
-	if ext == "" {
-		if byType, _ := mime.ExtensionsByType(contentType); len(byType) > 0 {
-			ext = byType[0]
-		}
+func resolveUploadIntentRelativeKey(filename, contentType string, metadata map[string]string, objectKey, keyPrefix string) (string, error) {
+	objectKey = strings.TrimSpace(objectKey)
+	keyPrefix = strings.TrimSpace(keyPrefix)
+	if objectKey != "" && keyPrefix != "" {
+		return "", fmt.Errorf("object_key and key_prefix are mutually exclusive")
 	}
-	if ext == "" {
-		ext = ".bin"
+	if objectKey != "" {
+		if err := corestorage.ValidateObjectKey(objectKey); err != nil {
+			return "", err
+		}
+		return objectKey, nil
 	}
 
-	name := uuid.NewString() + ext
+	name := generatedUploadObjectName(filename, contentType)
+	if keyPrefix != "" {
+		if err := corestorage.ValidateObjectKey(keyPrefix); err != nil {
+			return "", err
+		}
+		return path.Join(keyPrefix, name), nil
+	}
+
 	owner := strings.TrimSpace(metadata["owner_user_id"])
 	if owner == "" {
 		return name, nil
@@ -437,6 +448,20 @@ func generatedRelativeKey(filename, contentType string, metadata map[string]stri
 		return "", err
 	}
 	return path.Join(owner, name), nil
+}
+
+func generatedUploadObjectName(filename, contentType string) string {
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(filename)))
+	if ext == "" {
+		if byType, _ := mime.ExtensionsByType(contentType); len(byType) > 0 {
+			ext = byType[0]
+		}
+	}
+	if ext == "" {
+		ext = ".bin"
+	}
+
+	return uuid.NewString() + ext
 }
 
 // EncodeStorageKey builds the opaque key returned to external callers.

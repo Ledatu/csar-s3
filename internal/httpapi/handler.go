@@ -98,6 +98,8 @@ func (h *handler) handleMintUploadIntent(w http.ResponseWriter, r *http.Request)
 	intent, storageKey, err := h.svc.MintUploadIntent(r.Context(), service.MintUploadIntentRequest{
 		Scope:         req.Scope,
 		Filename:      req.Filename,
+		ObjectKey:     req.ObjectKey,
+		KeyPrefix:     req.KeyPrefix,
 		ContentType:   req.ContentType,
 		ContentLength: req.ContentLength,
 		Metadata:      req.Metadata,
