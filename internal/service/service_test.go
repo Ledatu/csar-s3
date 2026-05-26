@@ -3,11 +3,13 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
+	csarerrors "github.com/ledatu/csar-core/errors"
 	corestorage "github.com/ledatu/csar-core/storage"
 )
 
@@ -261,5 +263,248 @@ func TestIssueReadLinkUsesOpaqueStorageKey(t *testing.T) {
 	}
 	if link.URL != "https://signed-get" {
 		t.Fatalf("unexpected signed link %#v", link)
+	}
+}
+
+func newBrowserTestService(t *testing.T) (*Service, *fakeObjectStore) {
+	t.Helper()
+
+	store := &fakeObjectStore{bucket: "knowledge-bucket", objects: make(map[string]corestorage.ObjectInfo)}
+	svc, err := New(map[string]ScopeRuntime{
+		"knowledge-media": {
+			Policy: ScopePolicy{
+				Name:                "knowledge-media",
+				Bucket:              "knowledge-bucket",
+				KeyPrefix:           "knowledge",
+				MaxUploadBytes:      10 << 20,
+				AllowedContentTypes: map[string]struct{}{"image/png": {}},
+				DefaultIntentTTL:    5 * time.Minute,
+				MaxIntentTTL:        15 * time.Minute,
+				DefaultReadLinkTTL:  2 * time.Minute,
+				MaxReadLinkTTL:      5 * time.Minute,
+				BrowserProfiles: map[string]BrowserProfilePolicy{
+					"knowledge-editor-media": {
+						Name:           "knowledge-editor-media",
+						Enabled:        true,
+						RequireSubject: true,
+						KeyTemplate:    "uploads/{subject}/{uuid}{ext}",
+						AllowedOperations: map[string]struct{}{
+							"upload_intent": {},
+							"inspect":       {},
+							"finalize":      {},
+						},
+						AllowedMetadataKeys: map[string]struct{}{
+							"article_id": {},
+							"purpose":    {},
+						},
+						DefaultMetadata: map[string]string{"source": "browser"},
+					},
+					"knowledge-reader-media": {
+						Name:           "knowledge-reader-media",
+						Enabled:        true,
+						RequireSubject: true,
+						KeyTemplate:    "uploads/{subject}/{uuid}{ext}",
+						AllowedOperations: map[string]struct{}{
+							"upload_intent": {},
+							"inspect":       {},
+							"finalize":      {},
+							"read_link":     {},
+						},
+						AllowReadLinks: true,
+						AllowedMetadataKeys: map[string]struct{}{
+							"article_id": {},
+							"purpose":    {},
+						},
+						DefaultMetadata: map[string]string{"source": "browser"},
+					},
+				},
+			},
+			Objects: store,
+			Signer: fakeSigner{
+				put: corestorage.PresignedRequest{Method: "PUT", URL: "https://signed-browser-put", Headers: map[string]string{"Content-Type": "image/png"}},
+				get: corestorage.PresignedRequest{Method: "GET", URL: "https://signed-browser-get"},
+			},
+		},
+	}, NewMemoryIntentRepository())
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	return svc, store
+}
+
+func isDomainNotFound(err error) bool {
+	var domainErr *csarerrors.Error
+	return errors.As(err, &domainErr) && domainErr.Code == csarerrors.CodeNotFound
+}
+
+func TestMintBrowserUploadIntentUsesProfilePolicyOnly(t *testing.T) {
+	t.Parallel()
+
+	svc, _ := newBrowserTestService(t)
+
+	intent, err := svc.MintBrowserUploadIntent(context.Background(), MintBrowserUploadIntentRequest{
+		Profile:       "knowledge-editor-media",
+		Subject:       "subject-1",
+		Filename:      "Hero.PNG",
+		ContentType:   "image/png",
+		ContentLength: 42,
+		Metadata: map[string]string{
+			"Article_ID": "article-123",
+			"purpose":    "hero",
+		},
+	})
+	if err != nil {
+		t.Fatalf("MintBrowserUploadIntent returned error: %v", err)
+	}
+
+	if intent.Scope != "knowledge-media" {
+		t.Fatalf("expected profile-pinned scope, got %q", intent.Scope)
+	}
+	if intent.Object.Bucket != "knowledge-bucket" {
+		t.Fatalf("expected profile bucket, got %q", intent.Object.Bucket)
+	}
+	if !strings.HasPrefix(intent.Object.Key, "knowledge/uploads/subject-1/") {
+		t.Fatalf("expected subject-scoped generated key, got %q", intent.Object.Key)
+	}
+	if !strings.HasSuffix(intent.Object.Key, ".png") {
+		t.Fatalf("expected key extension from accepted upload, got %q", intent.Object.Key)
+	}
+	if strings.Contains(intent.Object.Key, "evil") || strings.Contains(intent.Object.Key, "authn-avatars") {
+		t.Fatalf("browser request influenced generated key: %q", intent.Object.Key)
+	}
+
+	gotTTL := intent.ExpiresAt.Sub(intent.CreatedAt)
+	if gotTTL != 5*time.Minute {
+		t.Fatalf("expected profile to use default TTL, got %s", gotTTL)
+	}
+	wantMetadata := map[string]string{
+		"article_id":           "article-123",
+		"purpose":              "hero",
+		"source":               "browser",
+		"csar_browser_profile": "knowledge-editor-media",
+		"csar_browser_scope":   "knowledge-media",
+		"csar_browser_subject": "subject-1",
+	}
+	for key, want := range wantMetadata {
+		if got := intent.Metadata[key]; got != want {
+			t.Fatalf("metadata %q = %q, want %q in %#v", key, got, want, intent.Metadata)
+		}
+	}
+}
+
+func TestMintBrowserUploadIntentRejectsMetadataOutsideAllowlist(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		metadata map[string]string
+	}{
+		{name: "arbitrary owner", metadata: map[string]string{"owner_user_id": "evil-owner"}},
+		{name: "default metadata override", metadata: map[string]string{"source": "spoofed"}},
+		{name: "reserved browser metadata", metadata: map[string]string{"csar_browser_subject": "subject-2"}},
+		{name: "public acl", metadata: map[string]string{"x-amz-acl": "public-read"}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			svc, _ := newBrowserTestService(t)
+			if _, err := svc.MintBrowserUploadIntent(context.Background(), MintBrowserUploadIntentRequest{
+				Profile:       "knowledge-editor-media",
+				Subject:       "subject-1",
+				Filename:      "hero.png",
+				ContentType:   "image/png",
+				ContentLength: 42,
+				Metadata:      tt.metadata,
+			}); err == nil {
+				t.Fatalf("expected disallowed metadata to be rejected")
+			}
+		})
+	}
+}
+
+func TestBrowserUploadIntentRequiresSameSubjectAndProfile(t *testing.T) {
+	t.Parallel()
+
+	svc, store := newBrowserTestService(t)
+	intent, err := svc.MintBrowserUploadIntent(context.Background(), MintBrowserUploadIntentRequest{
+		Profile:       "knowledge-editor-media",
+		Subject:       "subject-1",
+		Filename:      "hero.png",
+		ContentType:   "image/png",
+		ContentLength: 42,
+	})
+	if err != nil {
+		t.Fatalf("MintBrowserUploadIntent returned error: %v", err)
+	}
+
+	if _, err := svc.GetBrowserUploadIntent(context.Background(), GetBrowserUploadIntentRequest{
+		Profile: "knowledge-editor-media",
+		Subject: "subject-1",
+		ID:      intent.ID,
+	}); err != nil {
+		t.Fatalf("GetBrowserUploadIntent returned error: %v", err)
+	}
+	if _, err := svc.GetBrowserUploadIntent(context.Background(), GetBrowserUploadIntentRequest{
+		Profile: "knowledge-reader-media",
+		Subject: "subject-1",
+		ID:      intent.ID,
+	}); !isDomainNotFound(err) {
+		t.Fatalf("expected generic not-found for profile mismatch, got %v", err)
+	}
+	if _, err := svc.GetBrowserUploadIntent(context.Background(), GetBrowserUploadIntentRequest{
+		Profile: "knowledge-editor-media",
+		Subject: "subject-2",
+		ID:      intent.ID,
+	}); !isDomainNotFound(err) {
+		t.Fatalf("expected generic not-found for subject mismatch, got %v", err)
+	}
+
+	store.objects[intent.Object.Key] = corestorage.ObjectInfo{
+		Bucket:      "knowledge-bucket",
+		Key:         intent.Object.Key,
+		ContentType: "image/png",
+		Size:        42,
+	}
+	if _, _, err := svc.FinalizeBrowserUploadIntent(context.Background(), FinalizeBrowserUploadIntentRequest{
+		Profile: "knowledge-reader-media",
+		Subject: "subject-1",
+		ID:      intent.ID,
+	}); !isDomainNotFound(err) {
+		t.Fatalf("expected generic not-found for finalize profile mismatch, got %v", err)
+	}
+	finalized, storageKey, err := svc.FinalizeBrowserUploadIntent(context.Background(), FinalizeBrowserUploadIntentRequest{
+		Profile: "knowledge-editor-media",
+		Subject: "subject-1",
+		ID:      intent.ID,
+	})
+	if err != nil {
+		t.Fatalf("FinalizeBrowserUploadIntent returned error: %v", err)
+	}
+	if finalized.Status != corestorage.UploadIntentStatusFinalized {
+		t.Fatalf("expected finalized status, got %q", finalized.Status)
+	}
+	if storageKey != "knowledge-media:"+intent.Object.Key {
+		t.Fatalf("finalize used client state, got storage key %q", storageKey)
+	}
+}
+
+func TestBrowserReadLinkOperationRequiresExplicitProfileEnablement(t *testing.T) {
+	t.Parallel()
+
+	svc, _ := newBrowserTestService(t)
+
+	if _, err := svc.browserProfile("knowledge-editor-media", "read_link"); !isDomainNotFound(err) {
+		t.Fatalf("expected read links to be denied unless explicitly enabled, got %v", err)
+	}
+
+	runtime, err := svc.browserProfile("knowledge-reader-media", "read_link")
+	if err != nil {
+		t.Fatalf("expected explicitly enabled read-link profile, got %v", err)
+	}
+	if !runtime.Policy.AllowReadLinks {
+		t.Fatalf("expected read-link profile to require allow_read_links")
 	}
 }

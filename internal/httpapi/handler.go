@@ -9,7 +9,9 @@ import (
 	"time"
 
 	csarerrors "github.com/ledatu/csar-core/errors"
+	"github.com/ledatu/csar-core/gatewayctx"
 	"github.com/ledatu/csar-core/httpx"
+	corestorage "github.com/ledatu/csar-core/storage"
 	"github.com/ledatu/csar-s3/api"
 	"github.com/ledatu/csar-s3/internal/service"
 )
@@ -35,6 +37,9 @@ func New(svc *service.Service) http.Handler {
 	mux.HandleFunc("POST /svc/s3/v1/upload-intents/{intent_id}/finalize", h.handleFinalizeUploadIntent)
 	mux.HandleFunc(api.RouteIssueReadLink, h.handleIssueReadLink)
 	mux.HandleFunc("POST /svc/s3/v1/read-links", h.handleIssueReadLink)
+	mux.HandleFunc(api.RouteMintBrowserUploadIntent, h.handleMintBrowserUploadIntent)
+	mux.HandleFunc(api.RouteInspectBrowserUploadIntent, h.handleInspectBrowserUploadIntent)
+	mux.HandleFunc(api.RouteFinalizeBrowserUploadIntent, h.handleFinalizeBrowserUploadIntent)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -154,6 +159,82 @@ func (h *handler) handleIssueReadLink(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusCreated, api.IssueReadLinkResponse{Object: object, Link: link})
 }
 
+func (h *handler) handleMintBrowserUploadIntent(w http.ResponseWriter, r *http.Request) {
+	profile := r.PathValue("profile")
+	if err := service.ValidateBrowserProfileName(profile); err != nil {
+		httpx.WriteError(w, csarerrors.Validation("%v", err))
+		return
+	}
+
+	var req api.MintBrowserUploadIntentRequest
+	if err := httpx.ReadJSON(r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+
+	intent, err := h.svc.MintBrowserUploadIntent(r.Context(), service.MintBrowserUploadIntentRequest{
+		Profile:       profile,
+		Subject:       browserSubject(r),
+		Filename:      req.Filename,
+		ContentType:   req.ContentType,
+		ContentLength: req.ContentLength,
+		Metadata:      req.Metadata,
+	})
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+
+	httpx.WriteJSON(w, http.StatusCreated, api.MintBrowserUploadIntentResponse{Intent: browserAPIIntent(profile, intent)})
+}
+
+func (h *handler) handleInspectBrowserUploadIntent(w http.ResponseWriter, r *http.Request) {
+	profile := r.PathValue("profile")
+	if err := service.ValidateBrowserProfileName(profile); err != nil {
+		httpx.WriteError(w, csarerrors.Validation("%v", err))
+		return
+	}
+
+	intent, err := h.svc.GetBrowserUploadIntent(r.Context(), service.GetBrowserUploadIntentRequest{
+		Profile: profile,
+		Subject: browserSubject(r),
+		ID:      r.PathValue("intent_id"),
+	})
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+
+	httpx.WriteJSON(w, http.StatusOK, api.InspectBrowserUploadIntentResponse{Intent: browserAPIIntent(profile, intent)})
+}
+
+func (h *handler) handleFinalizeBrowserUploadIntent(w http.ResponseWriter, r *http.Request) {
+	profile := r.PathValue("profile")
+	if err := service.ValidateBrowserProfileName(profile); err != nil {
+		httpx.WriteError(w, csarerrors.Validation("%v", err))
+		return
+	}
+	if err := requireEmptyBody(r); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+
+	intent, storageKey, err := h.svc.FinalizeBrowserUploadIntent(r.Context(), service.FinalizeBrowserUploadIntentRequest{
+		Profile: profile,
+		Subject: browserSubject(r),
+		ID:      r.PathValue("intent_id"),
+	})
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+
+	httpx.WriteJSON(w, http.StatusOK, api.FinalizeBrowserUploadIntentResponse{
+		Intent:     browserAPIIntent(profile, intent),
+		StorageKey: storageKey,
+	})
+}
+
 func extractMetadataHeaders(header http.Header) map[string]string {
 	var metadata map[string]string
 	for key, values := range header {
@@ -174,4 +255,53 @@ func ttlFromSeconds(seconds int64) time.Duration {
 		return 0
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func browserSubject(r *http.Request) string {
+	if id, ok := gatewayctx.FromContext(r.Context()); ok {
+		return strings.TrimSpace(id.Subject)
+	}
+	return strings.TrimSpace(gatewayctx.FromRequest(r).Subject)
+}
+
+func requireEmptyBody(r *http.Request) error {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil
+	}
+	defer func() { _ = r.Body.Close() }()
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, 1))
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return csarerrors.Validation("request body must be empty")
+		}
+		return csarerrors.Internal(err)
+	}
+	if len(body) > 0 {
+		return csarerrors.Validation("request body must be empty")
+	}
+	return nil
+}
+
+func browserAPIIntent(profile string, intent corestorage.UploadIntent) api.BrowserUploadIntent {
+	out := api.BrowserUploadIntent{
+		ID:            intent.ID,
+		Profile:       profile,
+		Status:        intent.Status,
+		ContentType:   intent.Object.ContentType,
+		ContentLength: intent.ContentLength,
+		Metadata:      service.BrowserVisibleMetadata(intent.Metadata),
+		Upload:        intent.Upload,
+		CreatedAt:     intent.CreatedAt,
+		ExpiresAt:     intent.ExpiresAt,
+		FinalizedAt:   intent.FinalizedAt,
+	}
+	if intent.Status == corestorage.UploadIntentStatusFinalized {
+		out.Object = &api.BrowserUploadIntentObject{
+			ContentType: intent.Object.ContentType,
+			Size:        intent.Object.Size,
+			ETag:        intent.Object.ETag,
+		}
+	}
+	return out
 }

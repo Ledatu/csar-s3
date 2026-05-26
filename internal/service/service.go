@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"mime"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -17,7 +19,19 @@ import (
 	corestorage "github.com/ledatu/csar-core/storage"
 )
 
-const storageKeySeparator = ":"
+const (
+	storageKeySeparator = ":"
+
+	BrowserOperationUploadIntent = "upload_intent"
+	BrowserOperationInspect      = "inspect"
+	BrowserOperationFinalize     = "finalize"
+	BrowserOperationReadLink     = "read_link"
+
+	browserMetadataReservedPrefix = "csar_browser_"
+	browserMetadataSubjectKey     = browserMetadataReservedPrefix + "subject"
+	browserMetadataProfileKey     = browserMetadataReservedPrefix + "profile"
+	browserMetadataScopeKey       = browserMetadataReservedPrefix + "scope"
+)
 
 // ObjectStore is the storage backend used by the service layer.
 type ObjectStore interface {
@@ -50,6 +64,7 @@ type ScopePolicy struct {
 	MaxIntentTTL        time.Duration
 	DefaultReadLinkTTL  time.Duration
 	MaxReadLinkTTL      time.Duration
+	BrowserProfiles     map[string]BrowserProfilePolicy
 }
 
 // ScopeRuntime wires the policy plus concrete object store and signer.
@@ -79,10 +94,54 @@ type IssueReadLinkRequest struct {
 	TTL                 time.Duration
 }
 
+// BrowserProfilePolicy constrains browser upload intents to one configured scope.
+type BrowserProfilePolicy struct {
+	Name                string
+	Scope               string
+	Enabled             bool
+	RequireSubject      bool
+	KeyTemplate         string
+	AllowedOperations   map[string]struct{}
+	AllowReadLinks      bool
+	MaxUploadBytes      int64
+	AllowedMetadataKeys map[string]struct{}
+	DefaultMetadata     map[string]string
+}
+
+// MintBrowserUploadIntentRequest creates a browser profile-bound direct-upload intent.
+type MintBrowserUploadIntentRequest struct {
+	Profile       string
+	Subject       string
+	Filename      string
+	ContentType   string
+	ContentLength int64
+	Metadata      map[string]string
+}
+
+// GetBrowserUploadIntentRequest reads a browser profile and subject-bound intent.
+type GetBrowserUploadIntentRequest struct {
+	Profile string
+	Subject string
+	ID      string
+}
+
+// FinalizeBrowserUploadIntentRequest finalizes a browser profile and subject-bound intent.
+type FinalizeBrowserUploadIntentRequest struct {
+	Profile string
+	Subject string
+	ID      string
+}
+
+type browserProfileRuntime struct {
+	Policy BrowserProfilePolicy
+	Scope  ScopeRuntime
+}
+
 // Service implements the csar-s3 storage flow across multiple logical scopes.
 type Service struct {
-	scopes  map[string]ScopeRuntime
-	intents IntentRepository
+	scopes          map[string]ScopeRuntime
+	browserProfiles map[string]browserProfileRuntime
+	intents         IntentRepository
 }
 
 // New wires the service dependencies.
@@ -96,6 +155,7 @@ func New(scopes map[string]ScopeRuntime, intents IntentRepository) (*Service, er
 
 	normalized := make(map[string]ScopeRuntime, len(scopes))
 	seenKeys := make(map[string]string, len(scopes))
+	browserProfiles := make(map[string]browserProfileRuntime)
 	for name, runtime := range scopes {
 		scopeName := strings.TrimSpace(name)
 		if scopeName == "" {
@@ -131,10 +191,36 @@ func New(scopes map[string]ScopeRuntime, intents IntentRepository) (*Service, er
 			return nil, fmt.Errorf("service: scopes %q and %q share the same bucket/key_prefix", existing, scopeName)
 		}
 		seenKeys[dedupeKey] = scopeName
+
+		if len(runtime.Policy.BrowserProfiles) > 0 {
+			normalizedProfiles := make(map[string]BrowserProfilePolicy, len(runtime.Policy.BrowserProfiles))
+			for profileName, profile := range runtime.Policy.BrowserProfiles {
+				profileName = strings.TrimSpace(profileName)
+				if profileName == "" {
+					profileName = strings.TrimSpace(profile.Name)
+				}
+				profile.Name = profileName
+				if profile.Scope == "" {
+					profile.Scope = scopeName
+				}
+				if profile.Scope != scopeName {
+					return nil, fmt.Errorf("service: browser profile %q scope %q does not match parent scope %q", profileName, profile.Scope, scopeName)
+				}
+				if err := validateBrowserProfilePolicy(profile, runtime.Policy); err != nil {
+					return nil, err
+				}
+				if existing, ok := browserProfiles[profileName]; ok {
+					return nil, fmt.Errorf("service: browser profile %q is configured for both scopes %q and %q", profileName, existing.Policy.Scope, scopeName)
+				}
+				normalizedProfiles[profileName] = profile
+				browserProfiles[profileName] = browserProfileRuntime{Policy: profile, Scope: runtime}
+			}
+			runtime.Policy.BrowserProfiles = normalizedProfiles
+		}
 		normalized[scopeName] = runtime
 	}
 
-	return &Service{scopes: normalized, intents: intents}, nil
+	return &Service{scopes: normalized, browserProfiles: browserProfiles, intents: intents}, nil
 }
 
 // PutObject performs a server-side upload into the selected scope bucket.
@@ -257,6 +343,136 @@ func (s *Service) MintUploadIntent(ctx context.Context, in MintUploadIntentReque
 	return intent, storageKey, nil
 }
 
+// MintBrowserUploadIntent creates a browser-safe, profile-bound upload intent.
+func (s *Service) MintBrowserUploadIntent(ctx context.Context, in MintBrowserUploadIntentRequest) (corestorage.UploadIntent, error) {
+	profileRuntime, err := s.browserProfile(in.Profile, BrowserOperationUploadIntent)
+	if err != nil {
+		return corestorage.UploadIntent{}, err
+	}
+	profile := profileRuntime.Policy
+	scope := profileRuntime.Scope
+
+	subject, err := validateBrowserSubject(in.Subject, profile)
+	if err != nil {
+		return corestorage.UploadIntent{}, err
+	}
+
+	contentType := strings.TrimSpace(strings.ToLower(in.ContentType))
+	if err := validateScopeContentType(scope.Policy, contentType); err != nil {
+		return corestorage.UploadIntent{}, err
+	}
+	if in.ContentLength <= 0 {
+		return corestorage.UploadIntent{}, csarerrors.Validation("content length must be greater than zero")
+	}
+	maxUploadBytes := profile.MaxUploadBytes
+	if maxUploadBytes <= 0 {
+		maxUploadBytes = scope.Policy.MaxUploadBytes
+	}
+	if in.ContentLength > maxUploadBytes {
+		return corestorage.UploadIntent{}, csarerrors.Validation("content length exceeds browser profile max_upload_bytes")
+	}
+
+	metadata, err := browserIntentMetadata(profile, subject, in.Metadata)
+	if err != nil {
+		return corestorage.UploadIntent{}, err
+	}
+	relativeKey, err := renderBrowserKeyTemplate(profile.KeyTemplate, subject, in.Filename, contentType)
+	if err != nil {
+		return corestorage.UploadIntent{}, err
+	}
+	resolvedKey, err := resolveScopeObjectKey(scope.Policy, relativeKey)
+	if err != nil {
+		return corestorage.UploadIntent{}, err
+	}
+
+	ttl := scope.Policy.DefaultIntentTTL
+	input := corestorage.MintUploadIntentInput{
+		Scope:         scope.Policy.Name,
+		Filename:      strings.TrimSpace(in.Filename),
+		ContentType:   contentType,
+		ContentLength: in.ContentLength,
+		Metadata:      metadata,
+		TTL:           ttl,
+	}
+	if err := corestorage.ValidateMintUploadIntentInput(input); err != nil {
+		return corestorage.UploadIntent{}, csarerrors.Validation("%v", err)
+	}
+
+	now := time.Now().UTC()
+	upload, err := scope.Signer.PresignPut(ctx, corestorage.PresignPutInput{
+		Bucket:      scope.Policy.Bucket,
+		Key:         resolvedKey,
+		ContentType: input.ContentType,
+		Metadata:    input.Metadata,
+		Expires:     input.TTL,
+	})
+	if err != nil {
+		return corestorage.UploadIntent{}, csarerrors.Internal(err)
+	}
+
+	intent := corestorage.UploadIntent{
+		ID:            corestorage.NewUploadIntentID(),
+		Scope:         scope.Policy.Name,
+		Status:        corestorage.UploadIntentStatusPending,
+		Object:        corestorage.ObjectInfo{Bucket: scope.Policy.Bucket, Key: resolvedKey, ContentType: input.ContentType},
+		ContentLength: input.ContentLength,
+		Metadata:      cloneStringMap(input.Metadata),
+		Upload:        cloneSignedRequest(upload),
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(input.TTL),
+	}
+	if err := s.intents.Save(ctx, intent); err != nil {
+		return corestorage.UploadIntent{}, csarerrors.Internal(err)
+	}
+	return intent, nil
+}
+
+// GetBrowserUploadIntent returns a browser-safe intent only to its bound subject and profile.
+func (s *Service) GetBrowserUploadIntent(ctx context.Context, in GetBrowserUploadIntentRequest) (corestorage.UploadIntent, error) {
+	intent, _, err := s.boundBrowserIntent(ctx, in.Profile, in.Subject, in.ID, BrowserOperationInspect)
+	if err != nil {
+		return corestorage.UploadIntent{}, err
+	}
+	return intent, nil
+}
+
+// FinalizeBrowserUploadIntent finalizes a browser intent using only stored intent state.
+func (s *Service) FinalizeBrowserUploadIntent(ctx context.Context, in FinalizeBrowserUploadIntentRequest) (corestorage.UploadIntent, string, error) {
+	intent, profileRuntime, err := s.boundBrowserIntent(ctx, in.Profile, in.Subject, in.ID, BrowserOperationFinalize)
+	if err != nil {
+		return corestorage.UploadIntent{}, "", err
+	}
+	if intent.Status == corestorage.UploadIntentStatusExpired {
+		return corestorage.UploadIntent{}, "", browserIntentNotFound()
+	}
+
+	scope := profileRuntime.Scope
+	object, err := scope.Objects.HeadObject(ctx, intent.Object.Key)
+	if err != nil {
+		return corestorage.UploadIntent{}, "", err
+	}
+	if intent.ContentLength > 0 && object.Size > 0 && object.Size != intent.ContentLength {
+		return corestorage.UploadIntent{}, "", csarerrors.Conflict("uploaded object size does not match intent")
+	}
+	if intent.Object.ContentType != "" && object.ContentType != "" && !strings.EqualFold(intent.Object.ContentType, object.ContentType) {
+		return corestorage.UploadIntent{}, "", csarerrors.Conflict("uploaded object content type does not match intent")
+	}
+
+	now := time.Now().UTC()
+	intent.Status = corestorage.UploadIntentStatusFinalized
+	intent.Object = object
+	intent.FinalizedAt = &now
+	if err := s.intents.Put(ctx, intent); err != nil {
+		return corestorage.UploadIntent{}, "", csarerrors.Internal(err)
+	}
+
+	storageKey, err := EncodeStorageKey(profileRuntime.Policy.Scope, object.Key)
+	if err != nil {
+		return corestorage.UploadIntent{}, "", csarerrors.Internal(err)
+	}
+	return intent, storageKey, nil
+}
+
 // GetUploadIntent returns the tracked intent state.
 func (s *Service) GetUploadIntent(ctx context.Context, id string) (corestorage.UploadIntent, error) {
 	intent, err := s.intents.Get(ctx, id)
@@ -355,6 +571,50 @@ func (s *Service) IssueReadLink(ctx context.Context, in IssueReadLinkRequest) (c
 	return object, corestorage.ReadLink{URL: request.URL, Headers: cloneStringMap(request.Headers), ExpiresAt: request.ExpiresAt}, nil
 }
 
+func (s *Service) browserProfile(name, operation string) (browserProfileRuntime, error) {
+	if err := ValidateBrowserProfileName(name); err != nil {
+		return browserProfileRuntime{}, csarerrors.Validation("%v", err)
+	}
+	profileRuntime, ok := s.browserProfiles[strings.TrimSpace(name)]
+	if !ok || !profileRuntime.Policy.Enabled {
+		return browserProfileRuntime{}, csarerrors.NotFound("browser profile not found")
+	}
+	if _, ok := profileRuntime.Policy.AllowedOperations[operation]; !ok {
+		return browserProfileRuntime{}, csarerrors.NotFound("browser profile not found")
+	}
+	if operation == BrowserOperationReadLink && !profileRuntime.Policy.AllowReadLinks {
+		return browserProfileRuntime{}, csarerrors.NotFound("browser profile not found")
+	}
+	return profileRuntime, nil
+}
+
+func (s *Service) boundBrowserIntent(ctx context.Context, profileName, subject, id, operation string) (corestorage.UploadIntent, browserProfileRuntime, error) {
+	profileRuntime, err := s.browserProfile(profileName, operation)
+	if err != nil {
+		return corestorage.UploadIntent{}, browserProfileRuntime{}, err
+	}
+	subject, err = validateBrowserSubject(subject, profileRuntime.Policy)
+	if err != nil {
+		return corestorage.UploadIntent{}, browserProfileRuntime{}, err
+	}
+
+	intent, err := s.intents.Get(ctx, strings.TrimSpace(id))
+	if err != nil {
+		return corestorage.UploadIntent{}, browserProfileRuntime{}, browserRepositoryError(err)
+	}
+	intent, err = s.refreshIntentStatus(ctx, intent)
+	if err != nil {
+		return corestorage.UploadIntent{}, browserProfileRuntime{}, err
+	}
+	if intent.Status == corestorage.UploadIntentStatusExpired {
+		return corestorage.UploadIntent{}, browserProfileRuntime{}, browserIntentNotFound()
+	}
+	if !browserIntentMatches(intent, profileRuntime.Policy, subject) {
+		return corestorage.UploadIntent{}, browserProfileRuntime{}, browserIntentNotFound()
+	}
+	return intent, profileRuntime, nil
+}
+
 func (s *Service) scope(name string) (string, ScopeRuntime, error) {
 	name = strings.TrimSpace(name)
 	scope, ok := s.scopes[name]
@@ -398,6 +658,316 @@ func validateScopeContentType(scope ScopePolicy, contentType string) error {
 		return csarerrors.Validation("content type is not allowed for scope %q", scope.Name)
 	}
 	return nil
+}
+
+// ValidateBrowserProfileName restricts profile names to stable route-safe identifiers.
+func ValidateBrowserProfileName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("browser profile name is required")
+	}
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' {
+			continue
+		}
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if r == '-' || r == '_' {
+			continue
+		}
+		return fmt.Errorf("browser profile name %q contains unsupported characters", name)
+	}
+	return nil
+}
+
+// ValidateBrowserOperation restricts browser profiles to implemented operation names.
+func ValidateBrowserOperation(operation string) error {
+	switch strings.TrimSpace(operation) {
+	case BrowserOperationUploadIntent, BrowserOperationInspect, BrowserOperationFinalize, BrowserOperationReadLink:
+		return nil
+	default:
+		return fmt.Errorf("browser operation %q is not supported", operation)
+	}
+}
+
+// ValidateBrowserMetadataKey restricts user-controlled browser metadata names.
+func ValidateBrowserMetadataKey(key string) error {
+	key = strings.TrimSpace(strings.ToLower(key))
+	if key == "" {
+		return fmt.Errorf("metadata key is required")
+	}
+	if strings.HasPrefix(key, browserMetadataReservedPrefix) {
+		return fmt.Errorf("metadata key %q uses a reserved prefix", key)
+	}
+	for _, r := range key {
+		if r >= 'a' && r <= 'z' {
+			continue
+		}
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if r == '-' || r == '_' {
+			continue
+		}
+		return fmt.Errorf("metadata key %q contains unsupported characters", key)
+	}
+	return nil
+}
+
+// ValidateBrowserKeyTemplate restricts browser object-key interpolation to known tokens.
+func ValidateBrowserKeyTemplate(template string) error {
+	template = strings.TrimSpace(template)
+	if template == "" {
+		return fmt.Errorf("browser key_template is required")
+	}
+	if strings.Contains(template, `\`) {
+		return fmt.Errorf("browser key_template must not contain backslashes")
+	}
+	if !strings.Contains(template, "{uuid}") {
+		return fmt.Errorf("browser key_template must include {uuid}")
+	}
+	for i := 0; i < len(template); i++ {
+		switch template[i] {
+		case '{':
+			end := strings.IndexByte(template[i:], '}')
+			if end < 0 {
+				return fmt.Errorf("browser key_template has an unterminated placeholder")
+			}
+			token := template[i : i+end+1]
+			switch token {
+			case "{subject}", "{uuid}", "{ext}":
+			default:
+				return fmt.Errorf("browser key_template placeholder %q is not supported", token)
+			}
+			i += end
+		case '}':
+			return fmt.Errorf("browser key_template has an unmatched '}'")
+		}
+	}
+
+	sample := strings.ReplaceAll(template, "{subject}", "subject")
+	sample = strings.ReplaceAll(sample, "{uuid}", "00000000-0000-0000-0000-000000000000")
+	sample = strings.ReplaceAll(sample, "{ext}", ".bin")
+	if err := corestorage.ValidateObjectKey(sample); err != nil {
+		return fmt.Errorf("browser key_template is not a valid object key template: %w", err)
+	}
+	return nil
+}
+
+// BrowserVisibleMetadata returns browser-controlled metadata without service binding keys.
+func BrowserVisibleMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" || strings.HasPrefix(key, browserMetadataReservedPrefix) {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func validateBrowserProfilePolicy(profile BrowserProfilePolicy, scope ScopePolicy) error {
+	if err := ValidateBrowserProfileName(profile.Name); err != nil {
+		return fmt.Errorf("service: browser profile %q: %w", profile.Name, err)
+	}
+	if strings.TrimSpace(profile.Scope) == "" {
+		return fmt.Errorf("service: browser profile %q scope is required", profile.Name)
+	}
+	if err := ValidateBrowserKeyTemplate(profile.KeyTemplate); err != nil {
+		return fmt.Errorf("service: browser profile %q: %w", profile.Name, err)
+	}
+	if strings.Contains(profile.KeyTemplate, "{subject}") && !profile.RequireSubject {
+		return fmt.Errorf("service: browser profile %q key_template uses {subject} but require_subject is false", profile.Name)
+	}
+	if profile.MaxUploadBytes < 0 {
+		return fmt.Errorf("service: browser profile %q max_upload_bytes must be non-negative", profile.Name)
+	}
+	if profile.MaxUploadBytes > scope.MaxUploadBytes {
+		return fmt.Errorf("service: browser profile %q max_upload_bytes must not exceed parent scope max_upload_bytes", profile.Name)
+	}
+	if len(profile.AllowedOperations) == 0 {
+		return fmt.Errorf("service: browser profile %q must allow at least one operation", profile.Name)
+	}
+	for operation := range profile.AllowedOperations {
+		if err := ValidateBrowserOperation(operation); err != nil {
+			return fmt.Errorf("service: browser profile %q: %w", profile.Name, err)
+		}
+		if operation == BrowserOperationReadLink && !profile.AllowReadLinks {
+			return fmt.Errorf("service: browser profile %q read_link operation requires allow_read_links", profile.Name)
+		}
+	}
+	for key := range profile.AllowedMetadataKeys {
+		if err := ValidateBrowserMetadataKey(key); err != nil {
+			return fmt.Errorf("service: browser profile %q allowed metadata key: %w", profile.Name, err)
+		}
+	}
+	for key, value := range profile.DefaultMetadata {
+		if err := ValidateBrowserMetadataKey(key); err != nil {
+			return fmt.Errorf("service: browser profile %q default metadata key: %w", profile.Name, err)
+		}
+		if err := validateBrowserMetadataValue(value); err != nil {
+			return fmt.Errorf("service: browser profile %q default metadata %q: %w", profile.Name, key, err)
+		}
+	}
+	return nil
+}
+
+func validateBrowserSubject(subject string, profile BrowserProfilePolicy) (string, error) {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		if profile.RequireSubject {
+			return "", csarerrors.Validation("gateway subject is required")
+		}
+		return "", nil
+	}
+	if strings.Contains(subject, "/") || strings.Contains(subject, `\`) || strings.Contains(subject, "..") {
+		return "", csarerrors.Validation("gateway subject contains unsupported characters")
+	}
+	for _, r := range subject {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return "", csarerrors.Validation("gateway subject contains unsupported characters")
+	}
+	if err := corestorage.ValidateObjectKey(subject); err != nil {
+		return "", csarerrors.Validation("%v", err)
+	}
+	return subject, nil
+}
+
+func browserIntentMetadata(profile BrowserProfilePolicy, subject string, in map[string]string) (map[string]string, error) {
+	metadata := corestorage.CanonicalMetadata(profile.DefaultMetadata)
+	if len(metadata) == 0 {
+		metadata = make(map[string]string)
+	}
+	for key, value := range corestorage.CanonicalMetadata(in) {
+		if err := ValidateBrowserMetadataKey(key); err != nil {
+			return nil, csarerrors.Validation("%v", err)
+		}
+		if _, ok := profile.AllowedMetadataKeys[key]; !ok {
+			return nil, csarerrors.Validation("metadata key %q is not allowed for browser profile", key)
+		}
+		if _, exists := metadata[key]; exists {
+			return nil, csarerrors.Validation("metadata key %q is controlled by the browser profile", key)
+		}
+		if err := validateBrowserMetadataValue(value); err != nil {
+			return nil, csarerrors.Validation("%v", err)
+		}
+		metadata[key] = value
+	}
+	metadata[browserMetadataProfileKey] = profile.Name
+	metadata[browserMetadataScopeKey] = profile.Scope
+	if subject != "" {
+		metadata[browserMetadataSubjectKey] = subject
+	}
+	return metadata, nil
+}
+
+func validateBrowserMetadataValue(value string) error {
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("metadata value must not contain control characters")
+		}
+	}
+	return nil
+}
+
+func renderBrowserKeyTemplate(template, subject, filename, contentType string) (string, error) {
+	ext, err := browserFileExtension(filename, contentType)
+	if err != nil {
+		return "", err
+	}
+	key := strings.ReplaceAll(template, "{subject}", subject)
+	key = strings.ReplaceAll(key, "{uuid}", uuid.NewString())
+	key = strings.ReplaceAll(key, "{ext}", ext)
+	if err := corestorage.ValidateObjectKey(key); err != nil {
+		return "", csarerrors.Validation("%v", err)
+	}
+	return key, nil
+}
+
+func browserFileExtension(filename, contentType string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(filename)))
+	if ext != "" {
+		if err := validateBrowserExtension(ext); err != nil {
+			return "", err
+		}
+		if allowed, _ := mime.ExtensionsByType(contentType); len(allowed) > 0 && !containsExtension(allowed, ext) {
+			return "", csarerrors.Validation("filename extension does not match content_type")
+		}
+		return ext, nil
+	}
+	if byType, _ := mime.ExtensionsByType(contentType); len(byType) > 0 {
+		ext = strings.ToLower(byType[0])
+		if err := validateBrowserExtension(ext); err != nil {
+			return "", err
+		}
+		return ext, nil
+	}
+	return ".bin", nil
+}
+
+func validateBrowserExtension(ext string) error {
+	if ext == "" || ext[0] != '.' || strings.Contains(ext, "/") || strings.Contains(ext, `\`) || strings.Contains(ext, "..") {
+		return csarerrors.Validation("filename extension is invalid")
+	}
+	for _, r := range ext[1:] {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' {
+			continue
+		}
+		return csarerrors.Validation("filename extension is invalid")
+	}
+	return nil
+}
+
+func containsExtension(allowed []string, ext string) bool {
+	ext = strings.ToLower(ext)
+	for _, candidate := range allowed {
+		if strings.ToLower(candidate) == ext {
+			return true
+		}
+	}
+	return false
+}
+
+func browserIntentMatches(intent corestorage.UploadIntent, profile BrowserProfilePolicy, subject string) bool {
+	if intent.Scope != "" && intent.Scope != profile.Scope {
+		return false
+	}
+	if intent.Metadata[browserMetadataProfileKey] != profile.Name {
+		return false
+	}
+	if intent.Metadata[browserMetadataScopeKey] != profile.Scope {
+		return false
+	}
+	storedSubject, hasSubject := intent.Metadata[browserMetadataSubjectKey]
+	if subject == "" {
+		return !hasSubject || storedSubject == ""
+	}
+	return hasSubject && storedSubject == subject
+}
+
+func browserRepositoryError(err error) error {
+	var domainErr *csarerrors.Error
+	if stderrors.As(err, &domainErr) {
+		if domainErr.Code == csarerrors.CodeNotFound {
+			return browserIntentNotFound()
+		}
+		return err
+	}
+	return csarerrors.Internal(err)
+}
+
+func browserIntentNotFound() error {
+	return csarerrors.NotFound("upload intent not found")
 }
 
 func resolveScopeObjectKey(scope ScopePolicy, key string) (string, error) {

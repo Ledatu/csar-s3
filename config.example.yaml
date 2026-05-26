@@ -2,6 +2,13 @@ listen_addr: ":8087"
 health_addr: "127.0.0.1:9088"
 shutdown_timeout: "30s"
 
+intent_store:
+  type: "memory"
+  retention_buffer: "5m"
+  redis:
+    url: "${CSAR_S3_INTENT_REDIS_URL}"
+    key_prefix: "csar-s3:intents:"
+
 tls:
   cert_file: "/etc/csar/tls/s3-server.pem"
   key_file: "/etc/csar/tls/s3-server-key.pem"
