@@ -24,12 +24,16 @@ var Version = "dev"
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
-	ctx := context.Background()
+	if err := run(context.Background(), logger); err != nil {
+		logger.Error("s3 service failed", "error", err)
+		os.Exit(1)
+	}
+}
 
+func run(ctx context.Context, logger *slog.Logger) error {
 	cfg, err := config.Load(ctx, logger)
 	if err != nil {
-		logger.Error("load config", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("load config: %w", err)
 	}
 
 	scopeNames := cfg.ScopeNames()
@@ -39,14 +43,12 @@ func main() {
 	for _, name := range scopeNames {
 		signer, err := corestorage.NewS3Signer(cfg.SignerConfig(name))
 		if err != nil {
-			logger.Error("create signer", "scope", name, "error", err)
-			os.Exit(1)
+			return fmt.Errorf("create signer for %s: %w", name, err)
 		}
 
 		backend, err := service.NewS3Backend(cfg.BackendConfig(name))
 		if err != nil {
-			logger.Error("create s3 backend", "scope", name, "error", err)
-			os.Exit(1)
+			return fmt.Errorf("create s3 backend for %s: %w", name, err)
 		}
 
 		runtimes[name] = service.ScopeRuntime{
@@ -58,16 +60,13 @@ func main() {
 
 	intents, closeIntents, err := newIntentRepository(ctx, cfg.IntentStore, logger)
 	if err != nil {
-		logger.Error("create intent repository", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("create intent repository: %w", err)
 	}
 	defer closeIntents()
 
 	svc, err := service.New(runtimes, intents)
 	if err != nil {
-		closeIntents()
-		logger.Error("create service", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("create service: %w", err)
 	}
 
 	mux := http.NewServeMux()
@@ -86,9 +85,7 @@ func main() {
 			Logger:    logger.With("component", "health"),
 		})
 		if err != nil {
-			closeIntents()
-			logger.Error("create health sidecar", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("create health sidecar: %w", err)
 		}
 		go func() {
 			if err := healthSidecar.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -114,9 +111,7 @@ func main() {
 		ShutdownTimeout: cfg.ShutdownTimeout,
 	}, logger)
 	if err != nil {
-		closeIntents()
-		logger.Error("create http server", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("create http server: %w", err)
 	}
 
 	if err := server.Run(ctx); err != nil {
@@ -125,10 +120,9 @@ func main() {
 			defer shutdownCancel()
 			_ = healthSidecar.Shutdown(shutdownCtx)
 		}
-		closeIntents()
-		logger.Error("run server", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("run server: %w", err)
 	}
+	return nil
 }
 
 func newIntentRepository(ctx context.Context, cfg config.IntentStoreConfig, logger *slog.Logger) (service.IntentRepository, func(), error) {
